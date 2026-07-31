@@ -7,7 +7,7 @@ FROM docker.io/debian:trixie-20260518-slim
 # 1. Environment variables – configure autossh at runtime
 # ---------------------------------------------------------------
 # repository url
-ENV REPO_URL=https://github.com/eduardoenemark/containers/tree/main/autossh
+ENV REPO_URL=https://github.com/eduardoenemark/containers-autossh
 
 # build date/time
 ARG CREATED_DATETIME
