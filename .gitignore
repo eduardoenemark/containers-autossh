@@ -1,0 +1,37 @@
+.history
+temp/
+*.log
+*.txt
+*.bkp
+.env
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+# System files
+desktop.ini
+Thumbs.db
+# Build artifacts
+node_modules/
+dist/
+build/
+*.bundle.js
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+# Log files
+logs/
+*.log
