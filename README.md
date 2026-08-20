@@ -24,49 +24,63 @@ This container packages `autossh` alongside useful networking and debugging tool
 ./build.sh
 ```
 
-This uses Podman to build the `autossh:1.0` image from the Containerfile.
+This uses Podman (falls back to Docker if Podman is absent) to build the
+`autossh:1.0` image from the Containerfile.
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `--rm` | remove containers based on the image before building |
+| `--push` | push the image after a successful build (requires registry login) |
+| `IMAGE=meu/autossh:2.0 ./build.sh` | override the computed `name:version` tag |
+
+### Docker Compose / Podman Compose
+
+A ready-to-run, fully configurable stack is provided in `docker-compose.yml`.
+All tunables come from environment variables (see `.env.example`):
+
+```bash
+cp .env.example .env   # adjust SSH host/user/password/tunnels if needed
+podman compose up -d
+podman compose logs -f autossh
+podman compose down
+```
+
+Key settings in `.env`:
+
+| Variable | Description | Default |
+|---|---|---|
+| `SSH_HOST` / `SSH_PORT` / `SSH_USER` | remote SSH endpoint | `192.168.2.9` / `22` / `kali` |
+| `SSH_PASSWORD` | password for `sshpass` (required) | – |
+| `TUNNELS` | tunnel spec(s), any `-R`/`-L`/`-D` combo | `-R 8282:localhost:8282` |
+| `AUTOSSH_GATETIME` | `0` = never give up, keep retrying forever | `0` |
+| `AUTOSSH_POLL` | traffic test interval (seconds) | `30` |
+| `AUTOSSH_MONITOR_PORT` | `-M` monitor port | `20001` |
+
+The compose service runs `privileged` + host networking (required for direct
+port binding), `restart: unless-stopped`, caps CPU/memory via `deploy.resources`
+and persists autossh logs in a named volume (`autossh-logs`).
 
 ## Usage
 
 ### Single container run
 
 ```bash
-podman run --rm -it docker.io/eduardoenemark/autossh:1.0 sshpass -p 'PASSWORD' autossh -M 44444 -N -o 'ServerAliveInterval 10' -o 'ServerAliveCountMax 3' root@myvps-domain.com -R 8080:localhost:80
+podman run --rm -it autossh:1.0 sshpass -p 'PASSWORD' autossh -M 44444 -N -o 'ServerAliveInterval 10' -o 'ServerAliveCountMax 3' root@myvps-domain.com -R 8080:localhost:80
 ```
 
 The container passes `--wait` to `autossh` by default, which waits for SSH to be fully established before beginning monitoring.
 
 ### Docker Compose
 
-```yaml
-version: '3.8'
-services:
-  autossh:
-    image: docker.io/eduardoenemark/autossh:1.0
-    container_name: autossh
-    privileged: true
-    network_mode: host
-    restart: always
-    stop_grace_period: 15s
-    environment:
-      - AUTOSSH_GATETIME=0
-      - AUTOSSH_DEBUG=0
-    command: |
-      /bin/bash -c "
-      sshpass -p 'PASSWORD' autossh -M 44444 -N -o 'ServerAliveInterval 10' -o 'ServerAliveCountMax 3' -o 'ExitOnForwardFailure yes' -o 'StrictHostKeyChecking no' -o 'CheckHostIP no' -o 'TCPKeepAlive yes' -y root@myvps-domain.com -p 22 -R 48383:0.0.0.0:48383 -R 18282:0.0.0.0:18283 -R 500:0.0.0.0:5000 -R 7000:0.0.0.0:7000
-      "
-    deploy:
-      resources:
-        limits:
-          cpus: 1
-          memory: 512m
-```
+See `docker-compose.yml` + `.env.example` in this directory (setup and all
+configurable variables are documented in the *Installation* section above).
+Quick start:
 
 ```bash
-docker-compose up -d
+cp .env.example .env && podman compose up -d
 ```
-
-Replace `PASSWORD` with your SSH password and `root@myvps-domain.com` with your remote host. Adjust the `-R` reverse tunnel ports as needed.
 
 ## Environment Variables
 
@@ -106,11 +120,3 @@ Replace `PASSWORD` with your SSH password and `root@myvps-domain.com` with your 
 - The container requires **privileged mode** and **host networking** for direct port binding and tunnel manipulation.
 - Authentication must be pre-configured (via SSH keys or `sshpass`) -- the container cannot handle interactive password prompts.
 - Logs are mounted to `/var/log` for persistence and debugging.
-
-## Author
-
-Eduardo Vieira ([@eduardoenemark](https://t.me/eduardoenemark))
-
-## License
-
-[GPL-3.0-only](LICENSE)
