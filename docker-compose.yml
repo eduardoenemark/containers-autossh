@@ -1,0 +1,52 @@
+# =============================================================================
+# docker-compose.yml — autossh: SSH tunnel manager (VM A -> VM B)
+#
+# Uso:
+#   cp .env.example .env            # ajuste credenciais/host/túneis se necessário
+#   podman compose up -d            # sobe o túnel
+#   podman compose logs -f autossh  # acompanha o log do autossh
+#   podman compose down             # derruba
+#
+# Tudo é configurável via variáveis de ambiente (arquivo .env neste diretório).
+# =============================================================================
+name: autossh
+
+services:
+  autossh:
+    image: ${AUTOSSH_IMAGE:-autossh:1.0}
+    container_name: autossh-lab
+    privileged: true            # obrigatório: host networking + bind direto de portas
+    network_mode: host          # obrigatório: o túnel faz bind na NIC do host
+    restart: unless-stopped     # resiliência extra além do próprio autossh
+    stop_grace_period: 15s
+    environment:
+      # GATETIME=0 => autossh não desiste no início, reabre o túnel para sempre
+      AUTOSSH_GATETIME: ${AUTOSSH_GATETIME:-0}
+      # intervalo (s) entre testes de tráfego na porta de monitoramento
+      AUTOSSH_POLL: ${AUTOSSH_POLL:-30}
+      AUTOSSH_LOGFILE: /var/log/autossh.log
+    volumes:
+      - autossh-logs:/var/log   # logs do autossh persistem fora do container
+    command:
+      - /bin/bash
+      - -c
+      - |
+        exec sshpass -p '${SSH_PASSWORD:?defina SSH_PASSWORD no .env}' \
+          autossh -M '${AUTOSSH_MONITOR_PORT:-20001}' -N \
+          -o ServerAliveInterval='${SERVER_ALIVE_INTERVAL:-10}' \
+          -o ServerAliveCountMax='${SERVER_ALIVE_COUNT_MAX:-3}' \
+          -o ExitOnForwardFailure=yes \
+          -o StrictHostKeyChecking=no \
+          -o CheckHostIP=no \
+          -o TCPKeepAlive=yes \
+          -y '${SSH_USER:-kali}@${SSH_HOST:?defina SSH_HOST no .env}' \
+          -p '${SSH_PORT:-22}' \
+          ${TUNNELS:--R 8282:localhost:8282}
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT:-1}
+          memory: ${MEMORY_LIMIT:-512M}
+
+volumes:
+  autossh-logs:
