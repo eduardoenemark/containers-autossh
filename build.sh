@@ -42,12 +42,12 @@ fi
 # --- Nome e versão vindos dos labels OCI do Containerfile ---------------------
 NAME="$(awk '
   BEGIN { to_remove_regex = ".*=|[\"\\\\/]+| +$|^ +" }
-  /org.opencontainers.image.ref.name/{gsub(to_remove_regex,"", $0); name=$0}
+  /org.opencontainers.image.ref.name/{ s=$0; gsub(to_remove_regex,"",s); gsub(to_remove_regex,"",s); name=s }
   END{print name}' "${CONTAINER_FILE}")"
 
 VERSION="$(awk '
   BEGIN { to_remove_regex = ".*=|[\"\\\\/]+| +$|^ +" }
-  /org.opencontainers.image.version/{gsub(to_remove_regex,"", $0); version=$0}
+  /org.opencontainers.image.version/{ s=$0; gsub(to_remove_regex,"",s); gsub(to_remove_regex,"",s); version=s }
   END{print version}' "${CONTAINER_FILE}")"
 
 if [[ -z "${NAME}" || -z "${VERSION}" ]]; then

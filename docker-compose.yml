@@ -4,44 +4,58 @@
 # Uso:
 #   cp .env.example .env            # ajuste credenciais/host/túneis se necessário
 #   podman compose up -d            # sobe o túnel
-#   podman compose logs -f autossh  # acompanha o log do autossh
+#   podman compose logs -f autossh  # acompanha o log do entrypoint
+#   tail -f ~/.../autossh.log       # log do próprio autossh (volume de logs)
 #   podman compose down             # derruba
 #
 # Tudo é configurável via variáveis de ambiente (arquivo .env neste diretório).
+# A imagem 1.1+ traz no entrypoint: limpeza de forward obsoleto na inicialização,
+# watchdog end-to-end com auto-limpeza e rotação do log — não precisa mais de
+# bloco `command:` aqui; tudo vem via ambiente.
 # =============================================================================
 name: autossh
 
 services:
   autossh:
-    image: ${AUTOSSH_IMAGE:-autossh:1.0}
+    image: ${AUTOSSH_IMAGE:-autossh:1.1}
     container_name: autossh-lab
-    privileged: true            # obrigatório: host networking + bind direto de portas
-    network_mode: host          # obrigatório: o túnel faz bind na NIC do host
-    restart: unless-stopped     # resiliência extra além do próprio autossh
-    stop_grace_period: 15s
+    # host networking é obrigatório: o túnel faz bind na NIC do host
+    # (o entrypoint roda como root, então `privileged` NÃO é necessário)
+    network_mode: host
+    restart: always             # resiliência extra além do próprio autossh
+    stop_grace_period: 20s      # tempo para o entrypoint encerrar a árvore ssh
     environment:
-      # GATETIME=0 => autossh não desiste no início, reabre o túnel para sempre
-      AUTOSSH_GATETIME: ${AUTOSSH_GATETIME:-0}
-      # intervalo (s) entre testes de tráfego na porta de monitoramento
-      AUTOSSH_POLL: ${AUTOSSH_POLL:-30}
+      # --- destino SSH -------------------------------------------------------
+      SSH_HOST: ${SSH_HOST:?defina SSH_HOST no .env}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_USER: ${SSH_USER:-kali}
+      # senha via sshpass (opcional se usar chave; ver volumes abaixo)
+      SSH_PASSWORD: ${SSH_PASSWORD:-}
+      # caminho da chave DENTRO do container, vazio = usa senha
+      SSH_KEY_FILE: ${SSH_KEY_FILE:-}
+      SSH_CONNECT_TIMEOUT: ${SSH_CONNECT_TIMEOUT:-10}
+      # --- túneis (formato ssh: -R/-L/-D, pode ter vários) --------------------
+      TUNNELS: ${TUNNELS:--R 8282:localhost:8282}
+      # porta (lado remoto) usada pelo watchdog/healthcheck; vazio = inferida do 1º -R
+      TUNNEL_HEALTH_PORT: ${TUNNEL_HEALTH_PORT:-8282}
+      # --- resiliência / monitoramento ---------------------------------------
+      AUTOSSH_MONITOR_PORT: ${AUTOSSH_MONITOR_PORT:-20001}
+      AUTOSSH_GATETIME: ${AUTOSSH_GATETIME:-0}        # 0 = nunca desiste
+      AUTOSSH_POLL: ${AUTOSSH_POLL:-30}               # s entre sondas de tráfego
+      SERVER_ALIVE_INTERVAL: ${SERVER_ALIVE_INTERVAL:-10}
+      SERVER_ALIVE_COUNT_MAX: ${SERVER_ALIVE_COUNT_MAX:-3}
+      AUTOSSH_CLEANUP_STALE: ${AUTOSSH_CLEANUP_STALE:-1}  # 1 = limpa forward morto na inicialização
+      WATCHDOG_FAIL_THRESHOLD: ${WATCHDOG_FAIL_THRESHOLD:-2} # falhas seguidas p/ auto-limpeza
+      # o fuser precisa de root no remoto (sessões sshd não são visíveis ao usuário)
+      REMOTE_SUDO_PASSWORD: ${REMOTE_SUDO_PASSWORD:-}
+      CLEANUP_USE_SUDO: ${CLEANUP_USE_SUDO:-0}  # 1 = usa sudo -n (requer NOPASSWD)
       AUTOSSH_LOGFILE: /var/log/autossh.log
+      AUTOSSH_LOG_MAX_BYTES: ${AUTOSSH_LOG_MAX_BYTES:-5242880}  # ~5 MB por arquivo
     volumes:
       - autossh-logs:/var/log   # logs do autossh persistem fora do container
-    command:
-      - /bin/bash
-      - -c
-      - |
-        exec sshpass -p '${SSH_PASSWORD:?defina SSH_PASSWORD no .env}' \
-          autossh -M '${AUTOSSH_MONITOR_PORT:-20001}' -N \
-          -o ServerAliveInterval='${SERVER_ALIVE_INTERVAL:-10}' \
-          -o ServerAliveCountMax='${SERVER_ALIVE_COUNT_MAX:-3}' \
-          -o ExitOnForwardFailure=yes \
-          -o StrictHostKeyChecking=no \
-          -o CheckHostIP=no \
-          -o TCPKeepAlive=yes \
-          -y '${SSH_USER:-kali}@${SSH_HOST:?defina SSH_HOST no .env}' \
-          -p '${SSH_PORT:-22}' \
-          ${TUNNELS:--R 8282:localhost:8282}
+      # --- autenticacao por chave (alternativa a SSH_PASSWORD) ---------------
+      # descomente e ajuste o caminho no host para usar:
+      # - /home/kali/.ssh/id_ed25519:/ssh/key:ro
     deploy:
       resources:
         limits:

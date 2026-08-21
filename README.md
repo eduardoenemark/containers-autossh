@@ -1,31 +1,34 @@
 # Autossh: SSH Tunnel Manager
 
-A lightweight containerized SSH tunnel manager that runs `autossh` to create and monitor persistent SSH tunnels. The container automatically restarts the SSH session if it dies or stops passing traffic, ensuring continuous connectivity.
+A lightweight containerized SSH tunnel manager that runs `autossh` to create and monitor persistent SSH tunnels, wrapped in a resilient entrypoint that also recovers from failure modes plain autossh cannot.
 
 ## Overview
 
-`autossh` monitors your SSH sessions and restarts them automatically when they fail. It does this by establishing a loop of SSH forwardings and periodically sending test data to verify that traffic is flowing. If the SSH process crashes or stops passing traffic, `autossh` detects it and restarts the session.
+`autossh` monitors your SSH session and restarts it automatically when it fails or stops passing traffic. This image goes one step further: the container's **entrypoint** (`scripts/entrypoint.sh`) supervises autossh and adds:
 
-This container packages `autossh` alongside useful networking and debugging tools into a ready-to-run image for Podman and Docker.
+- **Stale-forward cleanup at startup** — kills whatever is squatting on the forwarded port on the remote host before connecting. This breaks the classic crash loop where a dead client left its `sshd` session holding the port, so every new connection dies with `remote port forwarding failed for listen port ...`.
+- **End-to-end watchdog** — periodically opens a real TCP connection to the forwarded port *on the remote side* via an independent SSH session. After N consecutive failures it re-runs the stale-forward cleanup automatically (no container restart needed).
+- **Container HEALTHCHECK** — the same probe (`tunnel-probe.sh`) is the image healthcheck, so with `restart: unless-stopped` the runtime recovers even if autossh itself wedges. Defense in depth: autossh watches ssh; the watchdog watches the tunnel; the runtime watches everything else.
+- **Size-based log rotation** — `AUTOSSH_LOGFILE` is rotated to `.1` when it exceeds `AUTOSSH_LOG_MAX_BYTES`.
+- **Signal-safe shutdown** — SIGTERM/SIGINT are forwarded to the ssh tree, so graceful stops release the remote forward immediately instead of leaving orphans.
 
-## Features
+### Failure modes handled (and why)
 
-- **Automatic tunnel restart** -- Detects dead SSH sessions and restarts them
-- **Traffic monitoring** -- Periodically tests data flow through the tunnel
-- **Exponential backoff** -- Gradually increases delay between restart attempts on repeated failures
-- **Starting gate protection** -- Exits early if initial SSH setup fails (prevents infinite retry loops)
-- **Built-in debugging tools** -- Includes `iftop`, `iptraf-ng`, `bmon`, `socat`, and `net-tools`
+| Failure | Detection | Recovery |
+|---|---|---|
+| SSH process dies | autossh (waitpid) | immediate restart with exponential backoff |
+| Dead connection, no RST (silent partition) | `ServerAliveInterval/CountMax` (~3×interval) + autossh monitor port | autossh reconnects |
+| Stale remote forward holds the port (`remote port forwarding failed`) | startup check / watchdog probe fails ×N | `fuser -k` on the remote port via an independent SSH session, then autossh retries succeed |
+| autossh itself wedges | container HEALTHCHECK (3× failures) | runtime restarts the container; entrypoint re-runs cleanup |
+| Client killed without notice (`kill -9`, power loss) | server-side `ClientAliveInterval` on the remote sshd | sshd reaps the dead session within ~interval×count, port freed |
 
 ## Installation
 
 ### Build the image
 
 ```bash
-./build.sh
+./build.sh          # builds autossh:1.1 (name/version come from OCI labels)
 ```
-
-This uses Podman (falls back to Docker if Podman is absent) to build the
-`autossh:1.0` image from the Containerfile.
 
 Options:
 
@@ -37,70 +40,70 @@ Options:
 
 ### Docker Compose / Podman Compose
 
-A ready-to-run, fully configurable stack is provided in `docker-compose.yml`.
-All tunables come from environment variables (see `.env.example`):
+A ready-to-run, fully env-driven stack is provided in `docker-compose.yml` — since v1.1 there is **no `command:` block**; everything comes from environment variables (see `.env.example`):
 
 ```bash
-cp .env.example .env   # adjust SSH host/user/password/tunnels if needed
+cp .env.example .env   # adjust SSH host/user/password/tunnels
 podman compose up -d
-podman compose logs -f autossh
+podman compose logs -f autossh     # entrypoint/watchdog log
+tail -f $(podman volume inspect autossh-logs --format '{{.Mountpoint}}')/autossh.log
 podman compose down
 ```
 
-Key settings in `.env`:
+The service runs with host networking (required so the tunnel binds on the host NIC), `restart: unless-stopped`, CPU/memory caps via `deploy.resources` and persists logs in the named volume `autossh-logs`. `privileged` is **not** required.
+
+### Recommended server-side tuning (both ends)
+
+So a dead client's forward is reaped quickly instead of lingering for hours, add to `/etc/ssh/sshd_config.d/20-tunnel-keepalive.conf` on the remote host and reload:
+
+```
+ClientAliveInterval 30
+ClientAliveCountMax 2
+```
+
+## Configuration (environment variables)
 
 | Variable | Description | Default |
 |---|---|---|
-| `SSH_HOST` / `SSH_PORT` / `SSH_USER` | remote SSH endpoint | `192.168.2.9` / `22` / `kali` |
-| `SSH_PASSWORD` | password for `sshpass` (required) | – |
-| `TUNNELS` | tunnel spec(s), any `-R`/`-L`/`-D` combo | `-R 8282:localhost:8282` |
-| `AUTOSSH_GATETIME` | `0` = never give up, keep retrying forever | `0` |
-| `AUTOSSH_POLL` | traffic test interval (seconds) | `30` |
-| `AUTOSSH_MONITOR_PORT` | `-M` monitor port | `20001` |
+| `SSH_HOST` / `SSH_PORT` / `SSH_USER` | remote SSH endpoint | – / `22` / `root` (`SSH_HOST` required) |
+| `SSH_PASSWORD` | password auth via sshpass (set this **or** `SSH_KEY_FILE`) | – |
+| `SSH_KEY_FILE` | path to a private key **inside the container** (mount it read-only); disables password auth | – |
+| `SSH_CONNECT_TIMEOUT` | TCP connect timeout per attempt (s) — keeps retries fast when the host is unreachable | `10` |
+| `TUNNELS` | any ssh `-R`/`-L`/`-D` spec(s), space-separated | `-R 8282:localhost:8282` |
+| `TUNNEL_HEALTH_PORT` | remote-side port for watchdog/healthcheck; empty = inferred from the first `-R` in `TUNNELS` | inferred |
+| `AUTOSSH_MONITOR_PORT` | local port autossh uses to test traffic (`-M`) | `20001` |
+| `AUTOSSH_GATETIME` | `0` = never give up, retry forever | `0` |
+| `AUTOSSH_POLL` | seconds between traffic/watchdog probes | `30` |
+| `SERVER_ALIVE_INTERVAL` / `SERVER_ALIVE_COUNT_MAX` | ssh keepalive — dead connections detected in ~interval×count | `10` / `3` |
+| `AUTOSSH_CLEANUP_STALE` | `1` = one-shot stale-forward cleanup at startup | `1` |
+| `REMOTE_SUDO_PASSWORD` | sudo password used by `fuser -k` on the remote (sshd sessions are invisible to plain users — root is required). Leave empty when using `CLEANUP_USE_SUDO` | – |
+| `CLEANUP_USE_SUDO` | `1` = use passwordless `sudo -n` on the remote (needs a sudoers NOPASSWD entry for `fuser`) | `0` |
+| `WATCHDOG_FAIL_THRESHOLD` | consecutive probe failures before auto-cleanup on the remote | `2` |
+| `AUTOSSH_LOGFILE` | autossh log path (also rotated) | `/var/log/autossh.log` |
+| `AUTOSSH_LOG_MAX_BYTES` | rotate when larger than this (~5 MB) | `5242880` |
 
-The compose service runs `privileged` + host networking (required for direct
-port binding), `restart: unless-stopped`, caps CPU/memory via `deploy.resources`
-and persists autossh logs in a named volume (`autossh-logs`).
-
-## Usage
-
-### Single container run
-
-```bash
-podman run --rm -it autossh:1.0 sshpass -p 'PASSWORD' autossh -M 44444 -N -o 'ServerAliveInterval 10' -o 'ServerAliveCountMax 3' root@myvps-domain.com -R 8080:localhost:80
-```
-
-The container passes `--wait` to `autossh` by default, which waits for SSH to be fully established before beginning monitoring.
-
-### Docker Compose
-
-See `docker-compose.yml` + `.env.example` in this directory (setup and all
-configurable variables are documented in the *Installation* section above).
-Quick start:
+### Single container run (no compose)
 
 ```bash
-cp .env.example .env && podman compose up -d
+podman run -d --name autossh \
+  -e SSH_HOST=myvps.example.com -e SSH_USER=root -e SSH_PASSWORD='SECRET' \
+  -e TUNNELS='-R 8080:localhost:80' -e AUTOSSH_GATETIME=0 \
+  autossh:1.1
 ```
 
-## Environment Variables
+Or with explicit args (bypasses the entrypoint):
 
-| Variable | Description | Default |
-|---|---|---|
-| `AUTOSSH_PORT` | Connection monitoring port (overrides `-M`) | Auto-generated |
-| `AUTOSSH_POLL` | Poll interval in seconds | 600 (10 minutes) |
-| `AUTOSSH_GATETIME` | Time SSH must be up before considered successful | 30 (seconds) |
-| `AUTOSSH_MAXLIFETIME` | Maximum seconds autossh should run | Unlimited |
-| `AUTOSSH_MAXSTART` | Max number of SSH restart attempts | -1 (unlimited) |
-| `AUTOSSH_LOGFILE` | Path to log file instead of syslog | Syslog |
-| `AUTOSSH_DEBUG` | Enable debug logging | Disabled |
+```bash
+podman run --rm -it autossh:1.1 sshpass -p 'PASSWORD' autossh -M 20001 -N -o ServerAliveInterval=10 -o ServerAliveCountMax=3 root@myvps-domain.com -R 8080:localhost:80
+```
 
 ## Exit Behavior
 
-1. If SSH exits normally (e.g., user typed `exit`), autossh exits too.
-2. If autossh receives SIGTERM/SIGINT/SIGKILL, it exits after killing the child SSH process.
-3. If autossh receives SIGUSR1, it kills the child and starts a new one.
-4. Periodically tests traffic on the monitor port; if failed, restarts SSH.
-5. If SSH dies for any other reason, autossh restarts it.
+1. If SSH exits normally, autossh exits too; the entrypoint propagates the status so `restart:` policies kick in.
+2. SIGTERM/SIGINT to the container are forwarded to the ssh tree (graceful stop releases remote forwards immediately).
+3. Periodic traffic test on the monitor port; failure restarts SSH with backoff.
+4. Watchdog: N failed end-to-end probes trigger a remote stale-forward cleanup while autossh keeps retrying.
+5. Healthcheck failures for long enough make the runtime restart the container (last-resort recovery).
 
 ## Included Tools
 
@@ -108,15 +111,29 @@ cp .env.example .env && podman compose up -d
 |---|---|
 | `autossh` | Core SSH tunnel monitor/restart tool |
 | `sshpass` | Non-interactive SSH password authentication |
-| `socat` | Bidirectional data relay / socket connector |
-| `net-tools` | Traditional networking tools (netstat, etc.) |
-| `iputils-ping` | Provides the `ping` command for network diagnostics |
-| `iftop` | Real-time bandwidth monitoring |
-| `iptraf-ng` | Network traffic monitor |
-| `bmon` | Bandwidth monitor |
+| `socat`, `netcat-openbsd`, `net-tools` | Data relay / socket checks (incl. healthcheck fallback) |
+| `iftop`, `iptraf-ng`, `bmon`, `iputils-ping` | Bandwidth/traffic diagnostics |
 
-| netcat-openbsd | Network utility for TCP/UDP connections (nc)
+## Resilience Test Suite
 
-- The container requires **privileged mode** and **host networking** for direct port binding and tunnel manipulation.
-- Authentication must be pre-configured (via SSH keys or `sshpass`) -- the container cannot handle interactive password prompts.
-- Logs are mounted to `/var/log` for persistence and debugging.
+`scripts/test-resilience.sh` runs a fault-injection matrix against the remote VM and measures time-to-recovery with a 2 s end-to-end probe loop:
+
+- **S0** cold start with a stale forward squatting on the port (real-world crash-loop repro)
+- **S2** remote `sshd` service restart
+- **S3** network partition for 60 s (iptables DROP, auto-teardown)
+- **S4** `podman kill` — client dies without notice; measures how fast the server reaps the orphaned forward
+- **S5** flapping: three short partitions in a row (no wedging)
+- **S6** graceful stop/start (forward released immediately on SIGTERM)
+
+```bash
+./scripts/test-resilience.sh            # all scenarios
+./scripts/test-resilience.sh S3 S4      # selected ones
+REMOTE_HOST=192.168.2.9 ./scripts/test-resilience.sh S0
+```
+
+## Notes & Limitations
+
+- **Host networking is required** (the tunnel must bind on the host NIC); `privileged` is not needed since v1.1.
+- The stale-forward cleanup kills whatever listens on `TUNNEL_HEALTH_PORT` on the remote — don't run two different tunnels sharing that port from different clients.
+- Password auth keeps the secret in env/`.env`; for production prefer SSH keys (see `SSH_KEY_FILE`).
+- Remote forwards bind to loopback on the server by default (OpenSSH ≥ 7.6), which is why the probe runs *on* the remote host via an independent session rather than dialing it from outside.
